@@ -1,0 +1,72 @@
+# Paths are resolved relative to this YAML file. Replace /data/... placeholders.
+model: /data1/workspace/ai_shared_workspace/WeVisOne-VL-4B  # or /data/models/WeVisOne-VL-4B
+revision: null
+output_dir: ../outputs/mixed_task_finetune
+seed: 42
+max_steps: 2000
+
+# Source weight controls QUERY sampling, independently of dataset size.
+# Equal weights below give approximately 50% detection / 50% segmentation.
+train:
+  - name: drawing_detection
+    task: detection
+    images: /data/detection/train/images
+    annotations: /data/detection/train/_annotations.coco.json
+    weight: 1.0
+    negative_queries_per_image: 1  # set 0 if labels are not exhaustive
+    # category_ids: [0, 1]        # optional; uses actual COCO IDs
+    # queries_jsonl: /data/detection/train/queries.jsonl
+  - name: specialty_segmentation
+    task: segmentation
+    images: /data/segmentation/train/images
+    annotations: /data/segmentation/train/_annotations.coco.json
+    weight: 1.0
+    negative_queries_per_image: 1
+
+validation:
+  - name: detection_valid
+    task: detection
+    images: /data/detection/valid/images
+    annotations: /data/detection/valid/_annotations.coco.json
+    negative_queries_per_image: 1
+  - name: segmentation_valid
+    task: segmentation
+    images: /data/segmentation/valid/images
+    annotations: /data/segmentation/valid/_annotations.coco.json
+    negative_queries_per_image: 1
+
+optimization:
+  gradient_accumulation_steps: 8  # batch/GPU = 1; effective batch = 8 * GPUs
+  mixed_precision: bf16         # no / bf16 / fp16; use no for CPU checks
+  learning_rate: 0.000005
+  decoder_learning_rate: 0.00001
+  vision_learning_rate: 0.0000005
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  warmup_steps: 100
+
+backbone:
+  lora: true
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  train_vision: false
+  train_embeddings: false      # true tunes full embedding + LM head matrices
+  attention_implementation: sdpa
+
+loss:
+  ntp_weight: 1.0
+  segmentation_weight: 10.0
+  focal_weight: 20.0
+  dice_weight: 1.0
+
+min_pixels: 16384
+max_pixels: 1048576
+max_length: 8192
+max_masks_per_sample: 24       # pixel supervision only; 0 = all masks
+save_every: 250
+validate_every: 250
+validation_samples_per_source: 32
+log_every: 10
+keep_last: 2                  # keep recent checkpoints plus best validation
+allow_validation_overlap: false

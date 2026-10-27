@@ -1,0 +1,65 @@
+model: /data1/workspace/ai_shared_workspace/WeVisOne-VL-4B
+revision: null
+output_dir: ../outputs/wall_finetune
+seed: 42
+max_steps: 20000
+checkpoint_metric: auto
+validation_samples_per_source: 0
+
+train:
+  - name: wall_train
+    task: segmentation
+    images: /data1/workspace/tien.nguyen/project/common/data/ykkap/yap-3/wall_seg_crop/train/images
+    annotations: /data1/workspace/tien.nguyen/project/common/data/ykkap/yap-3/wall_seg_crop_wevis/train/_annotations.coco.json
+    category_ids: [0]
+    weight: 1.0
+    # Includes a "wall" query for images with an empty wall mask.
+    negative_queries_per_image: 1
+
+validation:
+  - name: wall_valid
+    task: segmentation
+    images: /data1/workspace/tien.nguyen/project/common/data/ykkap/yap-3/wall_seg_crop/valid/images
+    annotations: /data1/workspace/tien.nguyen/project/common/data/ykkap/yap-3/wall_seg_crop_wevis/valid/_annotations.coco.json
+    category_ids: [0]
+    negative_queries_per_image: 1
+
+optimization:
+  gradient_accumulation_steps: 8
+  mixed_precision: bf16
+  learning_rate: 0.000005
+  decoder_learning_rate: 0.00001
+  vision_learning_rate: 0.0000005
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  warmup_steps: 100
+
+backbone:
+  lora: true
+  vision_lora: true
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  train_vision: false
+  train_embeddings: false
+  attention_implementation: sdpa
+
+loss:
+  ntp_weight: 1.0
+  segmentation_weight: 10.0
+  focal_weight: 20.0
+  dice_weight: 1.0
+
+min_pixels: 16384
+max_pixels: 1048576
+max_length: 8192
+
+# One wall instance per image.
+max_masks_per_sample: 1
+
+save_every: 250
+validate_every: 250
+validation_samples_per_source: 32
+log_every: 10
+keep_last: 2
+allow_validation_overlap: false
