@@ -2,7 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
+
+
+SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+def build_messages(image: Any, prompt: str) -> list[dict[str, Any]]:
+    """Shared conversation prefix for training, validation and inference."""
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": prompt},
+        ]},
+    ]
 
 
 TASKS = (

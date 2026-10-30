@@ -10,6 +10,7 @@ from PIL import Image
 
 from ..feature_bridge import (LastHiddenCapture, VisualFeatureCapture,
                               per_sample_premerge_feature_maps, premerge_grid_hw)
+from ..prompts import build_messages
 from .quality import detection_scores, foreground_scores, selection_score, parse_predictions
 
 
@@ -33,11 +34,7 @@ def predict_generated(model, processor, sample, accelerator, options):
     from accelerate.utils import send_to_device
 
     image = sample['image']
-    messages = [
-        {'role': 'system', 'content': 'You are a helpful assistant.'},
-        {'role': 'user', 'content': [{'type': 'image', 'image': image},
-                                     {'type': 'text', 'text': sample['prompt']}]},
-    ]
+    messages = build_messages(image, sample['prompt'])
     prefix = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = send_to_device(dict(processor(text=[prefix], images=[image],
                                           return_tensors='pt', padding=False)), accelerator.device)
@@ -67,7 +64,9 @@ def predict_generated(model, processor, sample, accelerator, options):
         with accelerator.autocast():
             with VisualFeatureCapture(model.backbone, model.cfg.vision_feature_layers) as visual:
                 with LastHiddenCapture(model.backbone) as hidden:
-                    model.vlm(**teacher, use_cache=False, return_dict=True, output_hidden_states=False)
+                    replay_options = {"logits_to_keep": 1} if model.selective_logits else {}
+                    model.vlm(**teacher, use_cache=False, return_dict=True,
+                              output_hidden_states=False, **replay_options)
             if hidden.hidden is None:
                 raise RuntimeError('generated response hidden states were not captured')
             grid = teacher['image_grid_thw']

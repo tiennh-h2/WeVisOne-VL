@@ -97,8 +97,9 @@ state cannot be resumed across that change. Existing configurations that omit
 `lora: false` fully tunes the LM; this needs substantially more VRAM.
 `train_embeddings: true` with LoRA also trains the full input/output embedding
 matrices; it can be expensive. Released special tokens already exist, so these
-matrices may remain frozen. Gradient checkpointing is disabled: the temporary
-capture hooks have not been validated with recomputation.
+matrices may remain frozen. Non-reentrant language-model and mask-decoder
+checkpointing can be enabled through the `performance` section described in
+[OPTIMIZATIONS.md](OPTIMIZATIONS.md). Vision checkpointing remains disabled.
 
 The pixel decoder follows the released FP32 implementation, including its alpha
 refinement branch. Here it receives binary-mask supervision. Matting-specific

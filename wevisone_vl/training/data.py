@@ -82,6 +82,13 @@ class CocoTaskDataset(Dataset):
         selected = list(spec.get("category_ids", self.categories))
         if not selected or any(cat not in self.categories for cat in selected):
             raise ValueError("category_ids must select existing categories")
+        # Partition mixed-supervision COCO sources without rewriting annotations.
+        # Exclusions also apply to absent-category queries below. IDs absent from
+        # a split are harmless, so one exclusion list can be shared across splits.
+        excluded = set(spec.get("exclude_category_ids", []))
+        selected = [cat for cat in selected if cat not in excluded]
+        if not selected:
+            raise ValueError("exclude_category_ids removes all selected categories")
         groups = defaultdict(list)
         crowds = set()
         for ann in self.annotations.values():

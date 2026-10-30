@@ -7,6 +7,8 @@ import json
 import math
 import random
 import shutil
+import time
+from threading import Lock
 from pathlib import Path
 
 import torch
@@ -14,7 +16,8 @@ import yaml
 
 from .collator import TrainingCollator
 from .data import CocoTaskDataset
-from .model import MixedTaskModel, configure_backbone
+from .model import MixedTaskModel, configure_backbone, configure_language_checkpointing
+from .performance import DEFAULTS as PERFORMANCE_DEFAULTS, prefetch
 from .quality import update_bests
 from .validation import evaluate_generation
 
@@ -26,7 +29,7 @@ def validate_config(cfg: dict) -> None:
         "max_masks_per_sample": 24, "save_every": 250, "validate_every": 250,
         "validation_samples_per_source": 32, "log_every": 10, "keep_last": 2,
         "allow_validation_overlap": False, "checkpoint_metric": "auto",
-        "generation_validation": {},
+        "generation_validation": {}, "performance": {},
     }
     unknown = set(cfg) - set(defaults) - {"model", "output_dir", "train", "optimization", "backbone", "loss"}
     if unknown:
@@ -55,6 +58,22 @@ def validate_config(cfg: dict) -> None:
             raise ValueError(f"unknown {name} keys: {sorted(set(section) - allowed)}")
         for key, value in values.items():
             section.setdefault(key, value)
+    performance = cfg["performance"]
+    if not isinstance(performance, dict) or set(performance) - set(PERFORMANCE_DEFAULTS):
+        raise ValueError("invalid performance settings")
+    for key, default in PERFORMANCE_DEFAULTS.items():
+        performance.setdefault(key, default)
+        value = performance[key]
+        if isinstance(default, bool) and not isinstance(value, bool):
+            raise ValueError(f"performance.{key} must be boolean")
+    if performance["fused_adamw"] != "auto" and type(performance["fused_adamw"]) is not bool:
+        raise ValueError("performance.fused_adamw must be auto, true or false")
+    depth = performance["prefetch_batches"]
+    if type(depth) is not int or depth < 0:
+        raise ValueError("performance.prefetch_batches must be an integer >= 0")
+    chunk_size = performance["refinement_chunk_size"]
+    if type(chunk_size) is not int or chunk_size < 0:
+        raise ValueError("performance.refinement_chunk_size must be an integer >= 0")
     backbone = cfg['backbone']
     vision_lora = backbone.get('vision_lora', False)
     if not isinstance(vision_lora, bool):
@@ -107,7 +126,8 @@ def validate_config(cfg: dict) -> None:
             raise ValueError(f"{split} must be a list of dataset sources")
         for source in cfg[split]:
             unknown = set(source) - {"name", "task", "images", "annotations", "weight",
-                                     "category_ids", "negative_queries_per_image", "queries_jsonl"}
+                                     "category_ids", "exclude_category_ids",
+                                     "negative_queries_per_image", "queries_jsonl"}
             if unknown:
                 raise ValueError(f"unknown source keys: {sorted(unknown)}")
             if any(not source.get(k) for k in ("name", "task", "images", "annotations")):
@@ -142,7 +162,7 @@ def load_config(path) -> dict:
 
 def resume_signature(cfg, legacy=False) -> str:
     value = {k: v for k, v in cfg.items() if k not in
-             {"output_dir", "save_every", "validate_every", "log_every", "keep_last"}
+             {"output_dir", "save_every", "validate_every", "log_every", "keep_last", "performance"}
              and not (legacy and k in {"checkpoint_metric", "generation_validation"})}
     digest = hashlib.sha256(json.dumps(value, sort_keys=True).encode())
     for source in cfg["train"] + cfg.get("validation", []):
@@ -183,7 +203,8 @@ def load_components(cfg):
     if sidecar.get("seg_token_id", seg_id) != seg_id:
         raise ValueError("sidecar/tokenizer OBJ token mismatch")
     # Trainable parameters stay FP32 unless frozen BF16 base weights can be used.
-    dtype = torch.bfloat16 if cfg["backbone"]["lora"] and cfg["optimization"]["mixed_precision"] == "bf16" else torch.float32
+    base_dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}
+    dtype = base_dtypes[cfg["optimization"]["mixed_precision"]] if cfg["backbone"]["lora"] else torch.float32
     vlm = AutoModelForImageTextToText.from_pretrained(
         cfg["model"], revision=cfg["revision"], dtype=dtype,
         attn_implementation=cfg["backbone"]["attention_implementation"], trust_remote_code=True)
@@ -195,12 +216,18 @@ def load_components(cfg):
     decoder = build_mask_decoder_from_qwen(vlm, decoder_cfg)
     decoder.load_state_dict(sidecar["state_dict"], strict=True)
     vlm = configure_backbone(vlm, cfg["backbone"])
+    performance = cfg.get("performance", PERFORMANCE_DEFAULTS)
+    configure_language_checkpointing(vlm, performance["language_checkpointing"])
     for parameter in vlm.parameters():
         if parameter.requires_grad:
             parameter.data = parameter.data.float()
     model = MixedTaskModel(vlm, decoder, decoder_cfg, seg_id, merge_size,
-                           max_masks_per_sample=cfg["max_masks_per_sample"], **cfg["loss"])
-    collator = TrainingCollator(processor, seg_id, decoder_cfg.cnn_image_size, cfg["max_length"])
+                           max_masks_per_sample=cfg["max_masks_per_sample"],
+                           selective_logits=performance["selective_logits"],
+                           decoder_checkpointing=performance["decoder_checkpointing"],
+                           refinement_chunk_size=performance["refinement_chunk_size"], **cfg["loss"])
+    collator = TrainingCollator(processor, seg_id, decoder_cfg.cnn_image_size, cfg["max_length"],
+                                fast_prefix=performance["fast_prefix"])
     return model, processor, collator
 
 
@@ -221,9 +248,10 @@ METRIC_KEYS = ("loss", "ntp_loss", "seg_loss", "focal_loss", "dice_loss", "mask_
 
 
 def metric_vector(output, device):
-    values = [float(output[key].detach()) for key in METRIC_KEYS]
+    values = torch.stack([output[key].detach().to(device=device, dtype=torch.float64)
+                          for key in METRIC_KEYS])
     values[-1] *= output["mask_count"]
-    return torch.tensor(values + [output["mask_count"], 1.], dtype=torch.float64, device=device)
+    return torch.cat((values, values.new_tensor([output["mask_count"], 1.])))
 
 
 def metric_dict(vector):
@@ -270,8 +298,16 @@ def make_optimizer(model, cfg):
         groups[group].append(parameter)
     rates = {"language": opt["learning_rate"], "vision": opt["vision_learning_rate"],
              "decoder": opt["decoder_learning_rate"]}
-    return torch.optim.AdamW([{"params": params, "lr": rates[key], "name": key}
-                              for key, params in groups.items() if params], weight_decay=opt["weight_decay"])
+    parameter_groups = [{"params": params, "lr": rates[key], "name": key}
+                        for key, params in groups.items() if params]
+    mode = cfg.get("performance", PERFORMANCE_DEFAULTS)["fused_adamw"]
+    cuda = all(p.device.type == "cuda" for group in parameter_groups for p in group["params"])
+    import inspect
+    supports_fused = "fused" in inspect.signature(torch.optim.AdamW).parameters
+    if mode is True and (not cuda or not supports_fused):
+        raise ValueError("fused AdamW requires CUDA parameters and a supporting PyTorch version")
+    kwargs = {"fused": mode is not False and cuda} if supports_fused else {}
+    return torch.optim.AdamW(parameter_groups, weight_decay=opt["weight_decay"], **kwargs)
 
 
 def train(cfg, resume=None):
@@ -296,6 +332,7 @@ def train(cfg, resume=None):
             raise ValueError("output_dir already contains training; use --resume or a new output_dir")
     accelerator.wait_for_everyone()
     model, processor, collator = load_components(cfg)
+    model.to(accelerator.device)
     optimizer = make_optimizer(model, cfg)
     warmup = opt["warmup_steps"]
     def lr_factor(step):
@@ -373,18 +410,30 @@ def train(cfg, resume=None):
     optimizer.zero_grad(set_to_none=True)
     window = {task: torch.zeros(8, dtype=torch.float64, device=accelerator.device)
               for task in ("detection", "segmentation")}
+    performance = cfg.get("performance", PERFORMANCE_DEFAULTS)
+    processor_lock = Lock()
+    def prepare_microbatch(micro_step):
+        source, index = choose_record(datasets, weights, cfg["seed"], micro_step, accelerator.process_index)
+        sample = datasets[source][index]
+        with processor_lock:
+            return collator([sample])
+    microbatches = prefetch(
+        range(start_step * opt["gradient_accumulation_steps"], cfg["max_steps"] * opt["gradient_accumulation_steps"]),
+        prepare_microbatch, performance["prefetch_batches"])
+    if accelerator.device.type == "cuda":
+        torch.cuda.synchronize(accelerator.device)
+        torch.cuda.reset_peak_memory_stats(accelerator.device)
+    window_start = time.perf_counter()
+    window_steps = 0
     for step in range(start_step, cfg["max_steps"]):
         for micro in range(opt["gradient_accumulation_steps"]):
-            micro_step = step * opt["gradient_accumulation_steps"] + micro
-            source, index = choose_record(datasets, weights, cfg["seed"], micro_step, accelerator.process_index)
-            sample = datasets[source][index]
-            batch = send_to_device(collator([sample]), accelerator.device)
+            batch = send_to_device(next(microbatches), accelerator.device)
             with accelerator.accumulate(model):
                 result = model(batch)
                 if not torch.isfinite(result["loss"]):
-                    raise FloatingPointError(f"nonfinite loss in source {sample['source']}, image {sample['image_id']}")
+                    raise FloatingPointError(f"nonfinite loss in source {batch['source']}, image {batch['image_id']}")
                 accelerator.backward(result["loss"])
-                window[sample["task"]] += metric_vector(result, accelerator.device)
+                window[batch["task"]] += metric_vector(result, accelerator.device)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), opt["max_grad_norm"])
                 optimizer.step()
@@ -392,6 +441,7 @@ def train(cfg, resume=None):
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
         completed = step + 1
+        window_steps += 1
         if completed % cfg["log_every"] == 0 or completed == cfg["max_steps"]:
             metrics = {}
             for task in sorted(window):
@@ -399,11 +449,24 @@ def train(cfg, resume=None):
                 if vector[-1] > 0:
                     metrics[task] = metric_dict(vector)
                 window[task].zero_()
+            if accelerator.device.type == "cuda":
+                torch.cuda.synchronize(accelerator.device)
+            elapsed = time.perf_counter() - window_start
+            timing = {"seconds_per_step": elapsed / window_steps,
+                      "queries_per_second": window_steps * opt["gradient_accumulation_steps"] * accelerator.num_processes / elapsed}
+            if accelerator.device.type == "cuda":
+                timing.update(peak_allocated_gib=torch.cuda.max_memory_allocated(accelerator.device) / 2**30,
+                              peak_reserved_gib=torch.cuda.max_memory_reserved(accelerator.device) / 2**30)
             log({"event": "train", "step": completed, "tasks": metrics,
-                 "learning_rates": scheduler.get_last_lr()})
+                 "learning_rates": scheduler.get_last_lr(), "performance": timing})
+            window_start, window_steps = time.perf_counter(), 0
+        pause_start = time.perf_counter()
         improved = False
         if validation and (completed % cfg["validate_every"] == 0 or completed == cfg["max_steps"]):
-            metrics = evaluate_generation(model, validation, processor, accelerator, cfg)
+            # Fast tokenizers mutate padding/truncation state during calls.
+            # Do not share a processor concurrently with the prefetch worker.
+            with processor_lock:
+                metrics = evaluate_generation(model, validation, processor, accelerator, cfg)
             checkpoint = str((output_dir / f"checkpoint-{completed:07d}").resolve())
             updated = update_bests(best_metrics, metrics['overall'], checkpoint)
             improved = updated != best_metrics
@@ -414,6 +477,11 @@ def train(cfg, resume=None):
                  "best_metrics": best_metrics, "improved": improved})
         if improved or completed % cfg["save_every"] == 0 or completed == cfg["max_steps"]:
             save(completed)
+        window_start += time.perf_counter() - pause_start
+        if validation and (completed % cfg["validate_every"] == 0 or completed == cfg["max_steps"]):
+            if accelerator.device.type == "cuda":
+                torch.cuda.synchronize(accelerator.device)
+                torch.cuda.reset_peak_memory_stats(accelerator.device)
     accelerator.wait_for_everyone()
     accelerator.end_training()
 

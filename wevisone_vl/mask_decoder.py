@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .config import Qwen3VLSegConfig
 from .msda import MultiScaleDeformableAttention
@@ -727,14 +728,8 @@ class WeVisOneMaskDecoder(nn.Module):
                 grid_hw,
             )
 
-    def _forward_fp32(
-        self,
-        image: torch.Tensor,
-        visual_features_2d: List[torch.Tensor],
-        t_seg: torch.Tensor,
-        boxes01: torch.Tensor,
-        grid_hw: Tuple[int, int],
-    ) -> Dict[str, torch.Tensor]:
+    def _prepare_decoding(self, image, visual_features_2d, t_seg, boxes01, grid_hw):
+        """Shared image encoding and joint object attention, before refinement."""
         if t_seg.shape[0] != boxes01.shape[0]:
             raise ValueError(
                 f"#OBJ={t_seg.shape[0]} does not match #boxes={boxes01.shape[0]}"
@@ -757,6 +752,11 @@ class WeVisOneMaskDecoder(nn.Module):
         )
         queries = queries.squeeze(0)
         pixel_feature = self.pixel_fusion(image, encoded)
+        return queries, pixel_feature
+
+    def _forward_fp32(self, image, visual_features_2d, t_seg, boxes01, grid_hw):
+        queries, pixel_feature = self._prepare_decoding(
+            image, visual_features_2d, t_seg, boxes01, grid_hw)
         coarse_logits = self.mask_predictor(queries, pixel_feature)
         logits_s1, logits_s2 = self.highres_refine(
             image,
@@ -771,3 +771,50 @@ class WeVisOneMaskDecoder(nn.Module):
             "mask_logits_coarse": coarse_logits,
             "mask_logits_lowres": coarse_logits,
         }
+
+    def forward_loss(self, image, visual_features_2d, t_seg, boxes01, grid_hw,
+                     targets, loss_fn, chunk_size=2, checkpointing=True):
+        """Training-only loss with bounded object refinement and no parameter changes.
+
+        Query attention remains joint. Each refinement/loss chunk is checkpointed
+        separately so backward never recomputes a full object batch at S/1.
+        """
+        if type(chunk_size) is not int or chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+        count = len(t_seg)
+        if count == 0 or len(targets) != count:
+            raise ValueError("chunked loss requires nonempty aligned queries/targets")
+        self.float()
+        with torch.autocast(device_type=image.device.type, enabled=False):
+            image = image.float()
+            features = [feature.float() for feature in visual_features_2d]
+            t_seg, boxes01 = t_seg.float(), boxes01.float()
+            recompute = checkpointing and self.training and torch.is_grad_enabled()
+
+            def prepare(rgb, feature_maps, embeddings, boxes):
+                return self._prepare_decoding(rgb, feature_maps, embeddings, boxes, grid_hw)
+
+            shared_args = (image, features, t_seg, boxes01)
+            if recompute:
+                queries, pixel_feature = checkpoint(prepare, *shared_args, use_reentrant=False)
+            else:
+                queries, pixel_feature = prepare(*shared_args)
+
+            def refine_loss(rgb, pixels, query, box, target):
+                coarse = self.mask_predictor(query, pixels)
+                logits, _ = self.highres_refine(rgb, pixels, query, box, coarse)
+                return loss_fn(logits, target)
+
+            totals = {}
+            for start in range(0, count, chunk_size):
+                stop = min(start + chunk_size, count)
+                args = (image, pixel_feature, queries[start:stop], boxes01[start:stop], targets[start:stop])
+                if recompute:
+                    losses = checkpoint(refine_loss, *args, use_reentrant=False)
+                else:
+                    losses = refine_loss(*args)
+                weight = (stop - start) / count
+                for name, value in losses.items():
+                    weighted = value * weight
+                    totals[name] = totals[name] + weighted if name in totals else weighted
+            return totals

@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image
 
 from .config import Qwen3VLSegConfig
-from .prompts import build_prompt
+from .prompts import SYSTEM_PROMPT, build_messages, build_prompt
 
 try:
     import torch
@@ -38,7 +38,6 @@ except ImportError:  # pragma: no cover - allows lightweight imports (prompts/vi
         return lambda fn: fn
 
 
-SYSTEM_PROMPT = "You are a helpful assistant."
 DEFAULT_MODEL_ID = "tencent/WeVisOne-VL-4B"
 BOX_RE = re.compile(r"<box>(.*?)(?:</box>|$)", re.DOTALL | re.IGNORECASE)
 COORD_RE = re.compile(r"<(\d{1,4})>")
@@ -201,16 +200,7 @@ class WeVisOneVL:
         self.cnn_size = int(getattr(self.cfg, "cnn_image_size", 1024) or 1024)
 
     def _messages(self, image: Image.Image, prompt: str) -> list[dict[str, Any]]:
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": prompt},
-                ],
-            },
-        ]
+        return build_messages(image, prompt)
 
     def _inputs(self, messages: list[dict[str, Any]], image: Image.Image, generation: bool):
         text = self.processor.apply_chat_template(
