@@ -11,6 +11,7 @@ from PIL import Image
 from ..feature_bridge import (LastHiddenCapture, VisualFeatureCapture,
                               per_sample_premerge_feature_maps, premerge_grid_hw)
 from ..prompts import build_messages
+from .distributed import is_fsdp, generation_forward
 from .quality import detection_scores, foreground_scores, selection_score, parse_predictions
 
 
@@ -98,6 +99,70 @@ def predict_generated(model, processor, sample, accelerator, options):
     return boxes, scores, masks, len(new_ids) >= options['max_new_tokens'], False
 
 
+@torch.no_grad()
+def greedy_fsdp_tokens(model, inputs, accelerator, options):
+    """Cached greedy decoding through the FSDP root, with synchronized EOS.
+
+    All ranks execute the same number of forwards. Finished ranks continue with
+    EOS tokens until all ranks finish, but only real generated tokens are scored.
+    Qwen's own prepare_inputs_for_generation retains native image/RoPE handling.
+    """
+    from copy import deepcopy
+    from transformers import LogitsProcessorList
+    base = accelerator.unwrap_model(model).vlm
+    ids = inputs['input_ids']
+    mask = inputs.get('attention_mask', torch.ones_like(ids))
+    visual = {k: v for k, v in inputs.items() if k not in {'input_ids', 'attention_mask'}}
+    generation = deepcopy(base.generation_config)
+    generation.update(max_new_tokens=options['max_new_tokens'],
+                      max_length=ids.shape[1] + options['max_new_tokens'],
+                      do_sample=False, num_beams=1, num_return_sequences=1,
+                      repetition_penalty=options['repetition_penalty'], use_cache=True)
+    base._prepare_special_tokens(generation, kwargs_has_attention_mask=True, device=ids.device)
+    processors = base._get_logits_processor(generation, input_ids_seq_length=ids.shape[1],
+                    logits_processor=LogitsProcessorList(), device=ids.device, model_kwargs=inputs)
+    eos = generation.eos_token_id
+    eos = set(eos if isinstance(eos, (list, tuple)) else [eos]) - {None}
+    cache = None
+    cache_position = torch.arange(ids.shape[1], device=ids.device)
+    tokens, probabilities = [], []
+    finished = False
+    for _ in range(options['max_new_tokens']):
+        prepared = base.prepare_inputs_for_generation(
+            ids, past_key_values=cache, attention_mask=mask,
+            cache_position=cache_position, use_cache=True, **visual)
+        with accelerator.autocast():
+            logits, cache = generation_forward(model, prepared)
+        scores = processors(ids, logits.float())
+        next_id = scores.argmax(-1)
+        if not finished:
+            token = int(next_id.item())
+            tokens.append(token)
+            probabilities.append(float(scores.log_softmax(-1)[0, token]))
+            finished = token in eos
+        ids = torch.cat((ids, next_id[:, None]), dim=1)
+        mask = torch.cat((mask, mask.new_ones((1, 1))), dim=1)
+        cache_position = cache_position[-1:] + 1
+        active = torch.tensor([0 if finished else 1], device=ids.device)
+        if accelerator.reduce(active, reduction='sum').item() == 0:
+            break
+    return tokens, probabilities
+
+
+@torch.no_grad()
+def predict_generated_fsdp(model, processor, sample, accelerator, options):
+    from accelerate.utils import send_to_device
+    messages = build_messages(sample['image'], sample['prompt'])
+    prefix = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = send_to_device(dict(processor(text=[prefix], images=[sample['image']],
+                           return_tensors='pt', padding=False)), accelerator.device)
+    ids, log_probs = greedy_fsdp_tokens(model, inputs, accelerator, options)
+    response = processor.tokenizer.decode(ids, skip_special_tokens=False,
+                                         clean_up_tokenization_spaces=False)
+    boxes, scores = parse_predictions(response, ids, log_probs, processor.tokenizer, False)
+    return boxes, scores, [], len(ids) >= options['max_new_tokens'], False
+
+
 def summarize(rows, max_detections):
     result = {'query_count': len(rows),
               'truncated_queries': sum(r['truncated'] for r in rows),
@@ -127,10 +192,18 @@ def evaluate_generation(model, datasets, processor, accelerator, cfg):
             random.Random(cfg['seed']).shuffle(indices)
             limit = cfg['validation_samples_per_source']
             indices = sorted(indices[:limit] if limit else indices)
-            for index in indices[accelerator.process_index::accelerator.num_processes]:
-                sample = dataset[index]
-                boxes, scores, masks, truncated, malformed = predict_generated(
-                    unwrapped, processor, sample, accelerator, options)
+            local_indices = indices[accelerator.process_index::accelerator.num_processes]
+            if is_fsdp(accelerator):
+                # Padded queries execute collectives but never contribute metrics.
+                count = (len(indices) + accelerator.num_processes - 1) // accelerator.num_processes
+                local_indices += [None] * (count - len(local_indices))
+            for index in local_indices:
+                sample = dataset[index if index is not None else indices[0]]
+                predict = predict_generated_fsdp if is_fsdp(accelerator) else predict_generated
+                boxes, scores, masks, truncated, malformed = predict(
+                    model if is_fsdp(accelerator) else unwrapped, processor, sample, accelerator, options)
+                if index is None:
+                    continue
                 row = {'source': dataset.name, 'index': index, 'task': sample['task'],
                        'query': sample['query'], 'boxes': sample['boxes'],
                        'pred_boxes': boxes, 'scores': scores,

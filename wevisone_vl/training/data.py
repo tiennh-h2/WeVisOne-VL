@@ -68,6 +68,9 @@ class CocoTaskDataset(Dataset):
 
     def __init__(self, spec: dict, seed: int = 42):
         self.spec = dict(spec)
+        self.seed = seed
+        self.query_mode = spec.get('query_mode', 'single')
+        self.phrase_sampling = spec.get('phrase_sampling', 'subset')
         self.name = str(spec.get("name", Path(spec["annotations"]).stem))
         self.task = spec["task"]
         if self.task not in {"detection", "segmentation"}:
@@ -134,11 +137,37 @@ class CocoTaskDataset(Dataset):
         for record in self.records:
             make_target(record["query"], [], self.task == "segmentation")
 
+        if self.query_mode == 'multi':
+            self.image_records = defaultdict(list)
+            for record in self.records:
+                self.image_records[record['image_id']].append(record)
+            self.grouped_images = list(self.image_records)
+
     def __len__(self):
-        return len(self.records)
+        return len(self.grouped_images) if self.query_mode == 'multi' else len(self.records)
 
     def __getitem__(self, index):
-        record = self.records[index]
+        return self.sample(index, epoch=0)
+
+    def sample(self, index, epoch=0):
+        if self.query_mode != 'multi':
+            return self._single(self.records[index])
+        records = list(self.image_records[self.grouped_images[index]])
+        rng = random.Random(self.seed + epoch * 1000003 + index * 1000033)
+        rng.shuffle(records)
+        if self.phrase_sampling == 'subset':
+            records = records[:rng.randint(1, len(records))]
+        samples = [self._single(record) for record in records]
+        result = dict(samples[0])
+        result['queries'] = [sample['query'] for sample in samples]
+        result['query'] = '\n'.join(result['queries'])
+        result['prompt'] = build_prompt(self.task, result['queries'])
+        result['response'] = ', '.join(sample['response'] for sample in samples)
+        result['boxes'] = [box for sample in samples for box in sample['boxes']]
+        result['annotation_ids'] = [i for sample in samples for i in sample['annotation_ids']]
+        return result
+
+    def _single(self, record):
         info = self.images[record["image_id"]]
         with Image.open(self.root / info["file_name"]) as opened:
             image = opened.convert("RGB")
@@ -163,7 +192,7 @@ class CocoTaskDataset(Dataset):
             # Validate before sorting and serialization.
             make_target(record["query"], [box], self.task == "segmentation")
             instances.append((box, ann_id, mask))
-        instances.sort(key=lambda item: (item[0][1], item[0][0], item[1]))
+        instances.sort(key=lambda item: item[0][0])
         boxes = [item[0] for item in instances]
         masks = None
         if self.task == "segmentation":

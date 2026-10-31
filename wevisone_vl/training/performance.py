@@ -7,6 +7,7 @@ DEFAULTS = {
     "selective_logits": True,
     "fast_prefix": True,
     "language_checkpointing": False,
+    "vision_checkpointing": False,
     "decoder_checkpointing": False,
     "refinement_chunk_size": 0,
     "fused_adamw": "auto",

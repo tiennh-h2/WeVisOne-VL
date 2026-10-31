@@ -49,6 +49,13 @@ class MixedTaskModel(nn.Module):
         return self.vlm.get_base_model() if hasattr(self.vlm, "get_base_model") else self.vlm
 
     def forward(self, batch):
+        if batch.get('generation_step', False):
+            # Must enter through the FSDP root forward on EVERY rank. Calling
+            # unwrapped.vlm.generate() bypasses root parameter all-gathers.
+            arguments = dict(batch['inputs'])
+            arguments.pop('use_cache', None)
+            return self.vlm(**arguments, use_cache=True, return_dict=True,
+                            output_hidden_states=False, logits_to_keep=1)
         inputs = batch["inputs"]
         positions = batch.get("obj_positions")
         if positions is None:
@@ -178,6 +185,10 @@ def configure_backbone(vlm, options: dict):
             parameter.requires_grad_('.lora_A.' in name or '.lora_B.' in name)
     else:
         visual.requires_grad_(bool(options.get("train_vision", False)))
+    if 'train_merger' in options:
+        for name, module in visual.named_modules():
+            if 'merger' in name.split('.')[-1]:
+                module.requires_grad_(options['train_merger'])
     if options.get("lora", True) and options.get("train_embeddings", False):
         vlm.get_input_embeddings().requires_grad_(True)
         vlm.get_output_embeddings().requires_grad_(True)
@@ -200,3 +211,13 @@ def configure_language_checkpointing(vlm, enabled=False):
     if language is None or not hasattr(language, "gradient_checkpointing_enable"):
         raise RuntimeError("language_checkpointing requires a Qwen language_model with checkpointing support")
     language.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+
+def configure_vision_checkpointing(vlm, enabled=False):
+    if not enabled:
+        return
+    base = vlm.get_base_model() if hasattr(vlm, 'get_base_model') else vlm
+    visual = base.model.visual
+    if not hasattr(visual, 'gradient_checkpointing_enable'):
+        raise RuntimeError('this Transformers vision module does not support gradient checkpointing')
+    visual.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})

@@ -1,0 +1,219 @@
+# Rex-style full detection SFT with FSDP1. Segmentation sources must remain disabled.
+# This config requires the accompanying training/data.py and training/runner.py.
+# Paths are literal: this trainer uses PyYAML, not Hydra/OmegaConf interpolation.
+model: /data1/workspace/ai_shared_workspace/model_zoo_shared/WeVisOne-VL-4B  # Or an exported WeVisOne-VL model directory.
+output_dir: ../outputs/one_task_rex_fsdp
+seed: 42
+
+# Rex-style full SFT; FSDP itself is selected by the separate launch YAML.
+recipe: rex_sft
+sampling: epochs
+num_train_epochs: 20
+loss_normalization: tokens
+max_length: 8192  # Retained from your YAML; Rex launcher uses 4096.
+min_pixels: 16384
+max_pixels: 1048576  # Retained for memory; the earlier Rex preset uses 2621440.
+max_masks_per_sample: 24
+save_every: 500
+validate_every: 500
+log_every: 1
+keep_last: 1
+allow_validation_overlap: false
+
+# Uses both task scores for mixed validation; does not reproduce SAM3 mask AP.
+checkpoint_metric: auto
+validation_samples_per_source: 32  # Use 0 to evaluate every query (slower).
+generation_validation:
+  max_new_tokens: 2048
+  mask_threshold: 0.5
+  decoder_batch_size: 8
+  max_detections: 100
+  repetition_penalty: 1.05
+
+performance:
+  selective_logits: true
+  fast_prefix: true
+  language_checkpointing: true
+  vision_checkpointing: true
+  fused_adamw: auto
+  prefetch_batches: 2
+
+backbone:
+  lora: false
+  vision_lora: false
+  train_vision: true
+  train_merger: true
+  train_embeddings: true
+  attention_implementation: sdpa
+
+optimization:
+  gradient_accumulation_steps: 8  # 4 GPUs x 1 image x 32 = global batch 128
+  mixed_precision: bf16
+  learning_rate: 2.0e-5
+  merger_learning_rate: 2.0e-5
+  decoder_learning_rate: 1.0e-5
+  vision_learning_rate: 2.0e-6
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  warmup_ratio: 0.03
+
+loss:
+  ntp_weight: 1.0
+  segmentation_weight: 0.0
+  focal_weight: 20.0
+  dice_weight: 1.0
+
+# Epoch sampling shuffles image records without replacement; active source weights must be 1.
+# The two NICE elevation weights sum to 1, like each other original dataset.
+# include_negatives=true is approximated by requesting all absent categories.
+# Crowded image/category queries remain excluded by the existing WeVis loader.
+train:
+# - name: nice_elevation_segmentation
+#   task: segmentation
+#   images: /home/tien.nguyen/workspace/project/common/data/nice/cropped_elevation_dataset_20261015_for_sam3/train
+#   annotations: /home/tien.nguyen/workspace/project/common/data/nice/cropped_elevation_dataset_20261015_for_sam3/train/_annotations.coco.json
+#   weight: 0.5
+#   negative_queries_per_image: 100000
+#   exclude_category_ids: &id001
+#   - 8
+#   - 29
+#   - 30
+#   - 31
+# - name: nice_elevation_detection
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/nice/cropped_elevation_dataset_20261015_for_sam3/train
+#   annotations: /home/tien.nguyen/workspace/project/common/data/nice/cropped_elevation_dataset_20261015_for_sam3/train/_annotations.coco.json
+#   weight: 0.5
+#   negative_queries_per_image: 100000
+#   category_ids: *id001
+# - name: nice_floor
+#   task: segmentation
+#   images: /home/tien.nguyen/workspace/project/common/data/nice/cropped_floor_dataset_20261015_for_sam3/train
+#   annotations: /home/tien.nguyen/workspace/project/common/data/nice/cropped_floor_dataset_20261015_for_sam3/train/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# - name: yap21_elevation
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/yap-2.1/cropped_elevation_dataset_20261015_for_sam3/train
+#   annotations: /home/tien.nguyen/workspace/project/common/data/yap-2.1/cropped_elevation_dataset_20261015_for_sam3/train/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+- name: yap21_floor
+  task: detection
+  query_mode: multi
+  phrase_sampling: subset
+  images: /home/tien.nguyen/workspace/project/common/data/yap-2.1/cropped_floor_dataset_20261015_for_sam3/train
+  annotations: /home/tien.nguyen/workspace/project/common/data/yap-2.1/cropped_floor_dataset_20261015_for_sam3/train/_annotations.coco.json
+  weight: 1.0
+  negative_queries_per_image: 100000
+# - name: yap2_elevation
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/yap-2/cropped_elevation_dataset_20261015_for_sam3/train
+#   annotations: /home/tien.nguyen/workspace/project/common/data/yap-2/cropped_elevation_dataset_20261015_for_sam3/train/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# - name: yap2_floor
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/yap-2/cropped_floor_dataset_20261015_for_sam3/train
+#   annotations: /home/tien.nguyen/workspace/project/common/data/yap-2/cropped_floor_dataset_20261015_for_sam3/train/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# - name: noda_floor
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/noda/cropped_floor_dataset_20261015_for_sam3/train
+#   annotations: /home/tien.nguyen/workspace/project/common/data/noda/cropped_floor_dataset_20261015_for_sam3/train/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# - name: yap_wall
+#   task: segmentation
+#   images: /home/tien.nguyen/workspace/project/common/data/yap-3/wall_seg_crop_for_sam3/train
+#   annotations: /home/tien.nguyen/workspace/project/common/data/yap-3/wall_seg_crop_for_sam3/train/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+validation:
+# - name: nice_elevation_segmentation
+#   task: segmentation
+#   images: /home/tien.nguyen/workspace/project/common/data/nice/cropped_elevation_dataset_20261015_for_sam3/valid
+#   annotations: /home/tien.nguyen/workspace/project/common/data/nice/cropped_elevation_dataset_20261015_for_sam3/valid/_annotations.coco.json
+#   weight: 0.5
+#   negative_queries_per_image: 100000
+#   exclude_category_ids: *id001
+# - name: nice_elevation_detection
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/nice/cropped_elevation_dataset_20261015_for_sam3/valid
+#   annotations: /home/tien.nguyen/workspace/project/common/data/nice/cropped_elevation_dataset_20261015_for_sam3/valid/_annotations.coco.json
+#   weight: 0.5
+#   negative_queries_per_image: 100000
+#   category_ids: *id001
+# - name: nice_floor
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/nice/cropped_floor_dataset_20261015_for_sam3/valid
+#   annotations: /home/tien.nguyen/workspace/project/common/data/nice/cropped_floor_dataset_20261015_for_sam3/valid/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# - name: yap21_elevation
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/yap-2.1/cropped_elevation_dataset_20261015_for_sam3/valid
+#   annotations: /home/tien.nguyen/workspace/project/common/data/yap-2.1/cropped_elevation_dataset_20261015_for_sam3/valid/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+- name: yap21_floor
+  task: detection
+  images: /home/tien.nguyen/workspace/project/common/data/yap-2.1/cropped_floor_dataset_20261015_for_sam3/valid
+  annotations: /home/tien.nguyen/workspace/project/common/data/yap-2.1/cropped_floor_dataset_20261015_for_sam3/valid/_annotations.coco.json
+  weight: 1.0
+  negative_queries_per_image: 100000
+# - name: yap2_elevation
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/yap-2/cropped_elevation_dataset_20261015_for_sam3/valid
+#   annotations: /home/tien.nguyen/workspace/project/common/data/yap-2/cropped_elevation_dataset_20261015_for_sam3/valid/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# - name: yap2_floor
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/yap-2/cropped_floor_dataset_20261015_for_sam3/valid
+#   annotations: /home/tien.nguyen/workspace/project/common/data/yap-2/cropped_floor_dataset_20261015_for_sam3/valid/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# - name: noda_floor
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/noda/cropped_floor_dataset_20261015_for_sam3/valid
+#   annotations: /home/tien.nguyen/workspace/project/common/data/noda/cropped_floor_dataset_20261015_for_sam3/valid/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# - name: yap_wall
+#   task: segmentation
+#   images: /home/tien.nguyen/workspace/project/common/data/yap-3/wall_seg_crop_for_sam3/valid
+#   annotations: /home/tien.nguyen/workspace/project/common/data/yap-3/wall_seg_crop_for_sam3/valid/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+
+# Optional FBM sources: roots were defined in SAM3, but not active in its train
+# or validation lists. To enable, add the corresponding entry to BOTH lists,
+# using /train for train and /valid for validation. Use a new output directory.
+# Example entries for train:
+# - name: fbm_floor
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/fbm/combined/standard_object_detection_dataset_20261002_for_sam3/train
+#   annotations: /home/tien.nguyen/workspace/project/common/data/fbm/combined/standard_object_detection_dataset_20261002_for_sam3/train/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# - name: fbm_wall
+#   task: segmentation
+#   images: /home/tien.nguyen/workspace/project/common/data/fbm/combined/fbm_wall_seg_20261002_for_sam3/train
+#   annotations: /home/tien.nguyen/workspace/project/common/data/fbm/combined/fbm_wall_seg_20261002_for_sam3/train/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# Example entries for valid:
+# - name: fbm_floor
+#   task: detection
+#   images: /home/tien.nguyen/workspace/project/common/data/fbm/combined/standard_object_detection_dataset_20261002_for_sam3/valid
+#   annotations: /home/tien.nguyen/workspace/project/common/data/fbm/combined/standard_object_detection_dataset_20261002_for_sam3/valid/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000
+# - name: fbm_wall
+#   task: segmentation
+#   images: /home/tien.nguyen/workspace/project/common/data/fbm/combined/fbm_wall_seg_20261002_for_sam3/valid
+#   annotations: /home/tien.nguyen/workspace/project/common/data/fbm/combined/fbm_wall_seg_20261002_for_sam3/valid/_annotations.coco.json
+#   weight: 1.0
+#   negative_queries_per_image: 100000

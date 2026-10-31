@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -16,13 +17,17 @@ import yaml
 
 from .collator import TrainingCollator
 from .data import CocoTaskDataset
-from .model import MixedTaskModel, configure_backbone, configure_language_checkpointing
+from .model import MixedTaskModel, configure_backbone, configure_language_checkpointing, configure_vision_checkpointing
 from .performance import DEFAULTS as PERFORMANCE_DEFAULTS, prefetch
 from .quality import update_bests
+from .recipe import apply_recipe
+from .sampling import EpochSchedule
+from .distributed import is_fsdp, configure_fsdp
 from .validation import evaluate_generation
 
 
 def validate_config(cfg: dict) -> None:
+    apply_recipe(cfg)
     defaults = {
         "seed": 42, "max_steps": 2000, "validation": [], "revision": None,
         "max_length": 8192, "min_pixels": 16 * 32 * 32, "max_pixels": 1024 * 1024,
@@ -30,6 +35,8 @@ def validate_config(cfg: dict) -> None:
         "validation_samples_per_source": 32, "log_every": 10, "keep_last": 2,
         "allow_validation_overlap": False, "checkpoint_metric": "auto",
         "generation_validation": {}, "performance": {},
+        "recipe": "legacy", "sampling": "weighted", "num_train_epochs": 1,
+        "loss_normalization": "queries",
     }
     unknown = set(cfg) - set(defaults) - {"model", "output_dir", "train", "optimization", "backbone", "loss"}
     if unknown:
@@ -45,6 +52,7 @@ def validate_config(cfg: dict) -> None:
         "optimization": {"gradient_accumulation_steps": 8, "mixed_precision": "bf16",
                          "learning_rate": 5e-6, "decoder_learning_rate": 1e-5,
                          "vision_learning_rate": 5e-7, "weight_decay": .01,
+                         "merger_learning_rate": None, "warmup_ratio": None,
                          "max_grad_norm": 1., "warmup_steps": min(100, cfg["max_steps"] // 20)},
         "backbone": {"lora": True, "lora_rank": 16, "lora_alpha": 32,
                      "lora_dropout": .05, "train_vision": False,
@@ -53,7 +61,7 @@ def validate_config(cfg: dict) -> None:
     }
     for name, values in sections.items():
         section = cfg.setdefault(name, {})
-        allowed = set(values) | ({'vision_lora'} if name == 'backbone' else set())
+        allowed = set(values) | ({'vision_lora', 'train_merger'} if name == 'backbone' else set())
         if set(section) - allowed:
             raise ValueError(f"unknown {name} keys: {sorted(set(section) - allowed)}")
         for key, value in values.items():
@@ -80,6 +88,18 @@ def validate_config(cfg: dict) -> None:
         raise ValueError('vision_lora must be a boolean')
     if vision_lora and (not backbone['lora'] or backbone['train_vision']):
         raise ValueError('vision_lora requires lora: true and train_vision: false')
+    if cfg['sampling'] not in {'weighted', 'epochs'}:
+        raise ValueError('sampling must be weighted or epochs')
+    if type(cfg['num_train_epochs']) is not int or cfg['num_train_epochs'] <= 0:
+        raise ValueError('num_train_epochs must be a positive integer')
+    if cfg['loss_normalization'] not in {'tokens', 'queries'}:
+        raise ValueError('loss_normalization must be tokens or queries')
+    if cfg['sampling'] == 'epochs' and any(float(s.get('weight', 1)) != 1 for s in cfg['train']):
+        raise ValueError('source weights are only used by weighted sampling; epochs require weight: 1')
+    if cfg.get('recipe') == 'rex_sft' and any(s['task'] != 'detection' for s in cfg['train']):
+        raise ValueError('rex_sft recipe requires detection training sources')
+    if 'train_merger' in backbone and type(backbone['train_merger']) is not bool:
+        raise ValueError('train_merger must be boolean')
     for key in ("model", "output_dir", "train"):
         if not cfg.get(key):
             raise ValueError(f"config requires {key}")
@@ -105,6 +125,12 @@ def validate_config(cfg: dict) -> None:
     opt = cfg["optimization"]
     for key in ("learning_rate", "decoder_learning_rate", "vision_learning_rate", "weight_decay", "max_grad_norm"):
         opt[key] = float(opt[key])
+    if opt['merger_learning_rate'] is not None:
+        opt['merger_learning_rate'] = float(opt['merger_learning_rate'])
+        if not math.isfinite(opt['merger_learning_rate']) or opt['merger_learning_rate'] <= 0:
+            raise ValueError('merger_learning_rate must be finite and positive')
+    if opt['warmup_ratio'] is not None and not 0 <= float(opt['warmup_ratio']) < 1:
+        raise ValueError('warmup_ratio must be in [0, 1)')
     for key in cfg["loss"]:
         cfg["loss"][key] = float(cfg["loss"][key])
     if not isinstance(opt["gradient_accumulation_steps"], int) or opt["gradient_accumulation_steps"] <= 0:
@@ -127,7 +153,7 @@ def validate_config(cfg: dict) -> None:
         for source in cfg[split]:
             unknown = set(source) - {"name", "task", "images", "annotations", "weight",
                                      "category_ids", "exclude_category_ids",
-                                     "negative_queries_per_image", "queries_jsonl"}
+                                     "negative_queries_per_image", "queries_jsonl", "query_mode", "phrase_sampling"}
             if unknown:
                 raise ValueError(f"unknown source keys: {sorted(unknown)}")
             if any(not source.get(k) for k in ("name", "task", "images", "annotations")):
@@ -137,6 +163,12 @@ def validate_config(cfg: dict) -> None:
             names.add(source["name"])
             if source["task"] not in {"detection", "segmentation"}:
                 raise ValueError("source task must be detection or segmentation")
+            if source.get('query_mode', 'single') not in {'single', 'multi'}:
+                raise ValueError('query_mode must be single or multi')
+            if source.get('phrase_sampling', 'subset') not in {'subset', 'all'}:
+                raise ValueError('phrase_sampling must be subset or all')
+            if source.get('query_mode') == 'multi' and (split != 'train' or source['task'] != 'detection'):
+                raise ValueError('multi queries are supported for detection training only; validation uses single queries')
             weight = float(source.get("weight", 1.))
             if not math.isfinite(weight) or weight <= 0:
                 raise ValueError("source weight must be finite and positive")
@@ -164,6 +196,16 @@ def resume_signature(cfg, legacy=False) -> str:
     value = {k: v for k, v in cfg.items() if k not in
              {"output_dir", "save_every", "validate_every", "log_every", "keep_last", "performance"}
              and not (legacy and k in {"checkpoint_metric", "generation_validation"})}
+    if cfg.get('recipe', 'legacy') == 'legacy':
+        # Keep signatures of pre-FSDP runs when all added options are inactive.
+        value = copy.deepcopy(value)
+        for key, default in [('recipe', 'legacy'), ('sampling', 'weighted'),
+                             ('num_train_epochs', 1), ('loss_normalization', 'queries')]:
+            if value.get(key) == default:
+                value.pop(key, None)
+        for key in ['merger_learning_rate', 'warmup_ratio']:
+            if value.get('optimization', {}).get(key) is None:
+                value.get('optimization', {}).pop(key, None)
     digest = hashlib.sha256(json.dumps(value, sort_keys=True).encode())
     for source in cfg["train"] + cfg.get("validation", []):
         for key in ("annotations", "queries_jsonl"):
@@ -218,6 +260,11 @@ def load_components(cfg):
     vlm = configure_backbone(vlm, cfg["backbone"])
     performance = cfg.get("performance", PERFORMANCE_DEFAULTS)
     configure_language_checkpointing(vlm, performance["language_checkpointing"])
+    if performance['vision_checkpointing'] and any(s['task'] == 'segmentation' for s in cfg['train']):
+        raise ValueError('vision_checkpointing is currently detection-only; segmentation feature hooks need original execution')
+    configure_vision_checkpointing(vlm, performance['vision_checkpointing'])
+    if cfg.get('recipe') == 'rex_sft' and not any(s['task'] == 'segmentation' for s in cfg['train']):
+        decoder.requires_grad_(False)
     for parameter in vlm.parameters():
         if parameter.requires_grad:
             parameter.data = parameter.data.float()
@@ -289,17 +336,30 @@ def evaluate(model, datasets, collator, accelerator, limit):
 
 def make_optimizer(model, cfg):
     opt = cfg["optimization"]
-    groups = {"language": [], "vision": [], "decoder": []}
-    vision_ids = {id(p) for p in model.backbone.model.visual.parameters()}
+    groups = {}
+    visual = model.backbone.model.visual
+    vision_ids = {id(p) for p in visual.parameters()}
+    merger_ids = {id(p) for name, module in visual.named_modules()
+                  if 'merger' in name.split('.')[-1]
+                  for p in module.parameters()}
+    if opt.get('merger_learning_rate') is None and 'train_merger' not in cfg['backbone']:
+        merger_ids = set()
+    rates = {'language': opt['learning_rate'], 'vision': opt['vision_learning_rate'],
+             'merger': opt.get('merger_learning_rate') or opt['vision_learning_rate'],
+             'decoder': opt['decoder_learning_rate']}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        group = "decoder" if name.startswith("mask_decoder.") else "vision" if id(parameter) in vision_ids else "language"
-        groups[group].append(parameter)
-    rates = {"language": opt["learning_rate"], "vision": opt["vision_learning_rate"],
-             "decoder": opt["decoder_learning_rate"]}
-    parameter_groups = [{"params": params, "lr": rates[key], "name": key}
-                        for key, params in groups.items() if params]
+        group = ('decoder' if name.startswith('mask_decoder.') else
+                 'merger' if id(parameter) in merger_ids else
+                 'vision' if id(parameter) in vision_ids else 'language')
+        # Rex uses separate decay/no-decay groups. Preserve legacy behavior.
+        decay = (parameter.ndim > 1 and not name.endswith('.bias')) if cfg.get('recipe') == 'rex_sft' else True
+        groups.setdefault((group, decay), []).append(parameter)
+    parameter_groups = [{'params': params, 'lr': rates[key], 'name': key,
+                         'weight_decay': opt['weight_decay'] if decay else 0.}
+                        for (key, decay), params in sorted(groups.items(), key=lambda item:
+                            (['language','vision','merger','decoder'].index(item[0][0]), not item[0][1]))]
     mode = cfg.get("performance", PERFORMANCE_DEFAULTS)["fused_adamw"]
     cuda = all(p.device.type == "cuda" for group in parameter_groups for p in group["params"])
     import inspect
@@ -318,12 +378,28 @@ def train(cfg, resume=None):
     accelerator = Accelerator(mixed_precision=opt["mixed_precision"],
                               gradient_accumulation_steps=opt["gradient_accumulation_steps"],
                               kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
-    if accelerator.distributed_type.name not in {"NO", "MULTI_GPU", "MULTI_CPU"}:
-        raise ValueError("this trainer supports single-process and DDP, not FSDP/DeepSpeed")
+    if accelerator.distributed_type.name not in {'NO', 'MULTI_GPU', 'MULTI_CPU', 'FSDP'}:
+        raise ValueError('supported backends: single-process, DDP, FSDP1')
+    if is_fsdp(accelerator):
+        # Check before from_pretrained: RAM-efficient loading can leave nonzero
+        # ranks with empty/meta weights, which our custom sidecar does not support.
+        plugin = accelerator.state.fsdp_plugin
+        if getattr(plugin, 'fsdp_version', 1) != 1 or plugin.cpu_ram_efficient_loading:
+            raise ValueError('use fsdp_version: 1 and fsdp_cpu_ram_efficient_loading: false')
+        if cfg['backbone']['lora'] or any(ds['task'] != 'detection' for ds in cfg['train'] + cfg['validation']):
+            raise ValueError('FSDP requires full backbone training and detection-only sources')
     if opt["mixed_precision"] == "bf16" and accelerator.device.type == "cuda" and not torch.cuda.is_bf16_supported():
         raise ValueError("BF16 unsupported by this GPU; choose mixed_precision: no or fp16")
     set_seed(cfg["seed"], device_specific=True)
     datasets, validation = build_datasets(cfg)
+    schedule = None
+    if cfg['sampling'] == 'epochs':
+        schedule = EpochSchedule([len(ds) for ds in datasets], cfg['num_train_epochs'],
+                                 accelerator.num_processes, opt['gradient_accumulation_steps'], cfg['seed'])
+        cfg['max_steps'] = schedule.max_steps
+    if opt['warmup_ratio'] is not None:
+        opt['warmup_steps'] = math.ceil(float(opt['warmup_ratio']) * cfg['max_steps'])
+        opt['warmup_steps'] = min(opt['warmup_steps'], cfg['max_steps'] - 1)
     signature = resume_signature(cfg)
     output_dir = Path(cfg["output_dir"])
     if accelerator.is_main_process:
@@ -332,7 +408,10 @@ def train(cfg, resume=None):
             raise ValueError("output_dir already contains training; use --resume or a new output_dir")
     accelerator.wait_for_everyone()
     model, processor, collator = load_components(cfg)
-    model.to(accelerator.device)
+    configure_fsdp(accelerator, model, cfg)
+    if not is_fsdp(accelerator):
+        model.to(accelerator.device)
+    trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     optimizer = make_optimizer(model, cfg)
     warmup = opt["warmup_steps"]
     def lr_factor(step):
@@ -353,6 +432,9 @@ def train(cfg, resume=None):
             valid_signatures.add(resume_signature(cfg, legacy=True))
         if state["signature"] not in valid_signatures or state["world_size"] != accelerator.num_processes:
             raise ValueError("resume config/data/world size changed; use the original config or start a new run")
+        backend = state.get('backend', 'ddp')
+        if (backend == 'fsdp') != is_fsdp(accelerator):
+            raise ValueError('resume backend changed; export weights and start a new run instead')
         accelerator.load_state(str(resume))
         start_step, best_loss, best_checkpoint = state["step"], state["best_loss"], state["best_checkpoint"]
         # Old loss-selected checkpoints are never treated as quality-selected bests.
@@ -378,7 +460,9 @@ def train(cfg, resume=None):
             (directory / "training_config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
             state = {"step": step, "signature": signature, "world_size": accelerator.num_processes,
                      "best_loss": best_loss, "best_checkpoint": best_checkpoint,
-                     "best_metrics": best_metrics}
+                     "best_metrics": best_metrics,
+                     "backend": 'fsdp' if is_fsdp(accelerator) else 'ddp',
+                     "checkpoint_format": 'sharded' if is_fsdp(accelerator) else 'full'}
             (directory / "training_state.json").write_text(json.dumps(state, indent=2))
             (output_dir / "latest_checkpoint.txt").write_text(str(directory))
             if best_checkpoint:
@@ -397,7 +481,9 @@ def train(cfg, resume=None):
         accelerator.wait_for_everyone()
 
     log({"event": "start", "step": start_step, "world_size": accelerator.num_processes,
-         "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+         "trainable_parameters": trainable_count,
+         "backend": accelerator.distributed_type.name, "sampling": cfg["sampling"],
+         "max_steps": cfg["max_steps"], "warmup_steps": opt["warmup_steps"],
          "train_queries": {ds.name: len(ds) for ds in datasets},
          "validation_queries": {ds.name: len(ds) for ds in validation},
          "validation": "free-running generation: foreground mIoU/mDice and COCO bbox mAP/mAR",
@@ -413,10 +499,17 @@ def train(cfg, resume=None):
     performance = cfg.get("performance", PERFORMANCE_DEFAULTS)
     processor_lock = Lock()
     def prepare_microbatch(micro_step):
-        source, index = choose_record(datasets, weights, cfg["seed"], micro_step, accelerator.process_index)
-        sample = datasets[source][index]
+        if schedule is not None:
+            step, micro = divmod(micro_step, opt['gradient_accumulation_steps'])
+            source, index, epoch, valid = schedule.record(step, micro, accelerator.process_index)
+        else:
+            source, index = choose_record(datasets, weights, cfg['seed'], micro_step, accelerator.process_index)
+            epoch, valid = micro_step, True
+        sample = datasets[source].sample(index, epoch=epoch)
         with processor_lock:
-            return collator([sample])
+            batch = collator([sample])
+        batch['sample_weight'] = float(valid)
+        return batch
     microbatches = prefetch(
         range(start_step * opt["gradient_accumulation_steps"], cfg["max_steps"] * opt["gradient_accumulation_steps"]),
         prepare_microbatch, performance["prefetch_batches"])
@@ -426,14 +519,25 @@ def train(cfg, resume=None):
     window_start = time.perf_counter()
     window_steps = 0
     for step in range(start_step, cfg["max_steps"]):
-        for micro in range(opt["gradient_accumulation_steps"]):
-            batch = send_to_device(next(microbatches), accelerator.device)
+        # Normalize over all real target tokens in this global optimizer batch,
+        # including unequal response lengths and the padded last epoch batch.
+        batches = [next(microbatches) for _ in range(opt['gradient_accumulation_steps'])]
+        counts = [int((batch['inputs']['labels'][:, 1:] != -100).sum()) * batch['sample_weight']
+                  for batch in batches]
+        totals = torch.tensor([sum(counts), sum(b['sample_weight'] for b in batches)],
+                              device=accelerator.device, dtype=torch.float64)
+        totals = accelerator.reduce(totals, reduction='sum')
+        denominator = totals[0 if cfg['loss_normalization'] == 'tokens' else 1].item()
+        for batch, token_count in zip(batches, counts):
+            numerator = token_count if cfg['loss_normalization'] == 'tokens' else batch['sample_weight']
+            scale = numerator * accelerator.num_processes * opt['gradient_accumulation_steps'] / denominator
+            batch = send_to_device(batch, accelerator.device)
             with accelerator.accumulate(model):
                 result = model(batch)
                 if not torch.isfinite(result["loss"]):
                     raise FloatingPointError(f"nonfinite loss in source {batch['source']}, image {batch['image_id']}")
-                accelerator.backward(result["loss"])
-                window[batch["task"]] += metric_vector(result, accelerator.device)
+                accelerator.backward(result['loss'] * scale)
+                window[batch['task']] += metric_vector(result, accelerator.device) * batch['sample_weight']
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), opt["max_grad_norm"])
                 optimizer.step()

@@ -1,5 +1,9 @@
 # Mixed detection and instance-segmentation fine-tuning
 
+For the new full-parameter Rex-style SFT/FSDP1 recipe, see
+[REX_SFT_GUIDE.md](../../REX_SFT_GUIDE.md) and `configs/rex_sft.yaml`.
+The legacy training path below remains the default unless `recipe: rex_sft` is selected.
+
 This extension fine-tunes a released Tencent WeVisOne-VL checkpoint using mixed
 COCO sources. It reuses the original architecture and leaves existing inference
 code unchanged. Upstream baseline: `40f735b8daed437ece982db9718e9c9856f52a79`.
@@ -150,8 +154,8 @@ accelerate launch --multi_gpu --num_processes 2 -m wevisone_vl.training \
 Effective batch size = accumulation steps × process count. Each rank draws the
 same source/task but independently samples an image/query. There is no artificial
 epoch: training runs for `max_steps` optimizer-update attempts. FP16 overflow can
-skip an update; BF16 is the default on supported GPUs. FSDP, DeepSpeed, quantized
-training, video inputs and sequence packing are not supported.
+skip an update; BF16 is the default on supported GPUs. DeepSpeed, quantized training, video inputs and sequence packing are not supported.
+FSDP1 is supported for full-parameter detection-only training; see the Rex SFT guide.
 
 For a small overfit check, use one small source, `max_steps: 20`,
 `warmup_steps: 0`, and small image/token budgets. With limited VRAM, first lower

@@ -1,0 +1,23 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: bf16
+num_machines: 1
+num_processes: 2
+machine_rank: 0
+main_training_function: main
+rdzv_backend: static
+same_network: true
+use_cpu: false
+fsdp_config:
+  fsdp_version: 1
+  fsdp_sharding_strategy: FULL_SHARD
+  # The trainer supplies auto-wrap from the loaded model's actual block classes.
+  fsdp_auto_wrap_policy: NO_WRAP
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_sync_module_states: true
+  fsdp_offload_params: true
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_activation_checkpointing: false

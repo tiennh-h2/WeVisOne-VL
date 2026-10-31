@@ -24,9 +24,8 @@ def export_checkpoint(checkpoint, output):
         raise ValueError("export output must be a new or empty directory")
     cfg = load_config(checkpoint / "training_config.yaml")
     model, processor, _ = load_components(cfg)
-    weights = checkpoint / "pytorch_model.bin"
-    if not weights.is_file():
-        raise FileNotFoundError(f"missing full training state: {weights}; use a checkpoint from this trainer")
+    from .distributed import resolve_checkpoint_weights
+    weights = resolve_checkpoint_weights(checkpoint)
     model.load_state_dict(torch.load(weights, map_location="cpu", weights_only=True), strict=True)
     model.cpu().eval()
     vlm = model.vlm
